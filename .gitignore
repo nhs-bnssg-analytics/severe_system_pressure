@@ -1,0 +1,17 @@
+.Rproj.user
+.Rhistory
+.RData
+
+ssp.Rproj
+
+# unecessary folders
+background/
+original_R/
+original_outputs/
+tests/data_checks/
+
+# unecessary files
+*.png
+*.rds
+*.pptx
+*.csv
