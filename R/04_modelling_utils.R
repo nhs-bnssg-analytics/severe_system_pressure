@@ -154,8 +154,9 @@ lag_function <- function(data, lags) {
 }
 
 
-model_function <- function(data, model_day, grid_search = 1, model_type) {
+model_function <- function(data, model_day, grid_search = 1, model_type, auto_feature_selection = TRUE) {
 
+  cat(paste("Day", model_day, "\n"))
   model_type <- match.arg(
     model_type,
     c("glmnet", "rf")
@@ -165,7 +166,8 @@ model_function <- function(data, model_day, grid_search = 1, model_type) {
     lag_function(lags = model_day:(model_day + 6)) |>
     slice(-(1:(model_day + 6)))
 
-  splits <- initial_validation_time_split(data)
+  splits <- initial_validation_time_split(data) # I think we need to do this because when we're applying the model it will be applied chronologically, like the validation hyperparameter tuning
+  # splits <- initial_validation_split(data)
   val_set <- validation_set(splits)
 
   predictors <- setdiff(names(data), c("date", "breach"))
@@ -181,17 +183,73 @@ model_function <- function(data, model_day, grid_search = 1, model_type) {
     step_rm(date) |>
     update_role(breach, new_role = "outcome") |>
     update_role(all_of(predictors), new_role = "predictor") |>
-    step_zv(all_numeric_predictors()) |>
-    step_pca(
-      # num_comp = tune()
-      all_numeric_predictors(),
-      num_comp = 20
-    )
-
+    step_nzv(all_numeric_predictors()) |>
+    step_corr(all_numeric_predictors())
 
   cores <- parallel::detectCores()
 
+  if (isTRUE(auto_feature_selection)) {
+    tm <- Sys.time()
+    cat("...feature elimination....")
+    tm <- log_the_time(tm)
+    cat("...counting baked cols....")
+    baked_cols <- recipe |>
+      prep(
+        training = training(splits)
+      ) |>
+      juice(
+        all_predictors()
+      ) |>
+      ncol()
+
+    tm <- log_the_time(tm)
+    cat("...rfeControl stage....")
+    ctrl <- caret::rfeControl(
+      functions = lrFuncs,
+      method = "timeslice",
+      repeats = 5,
+      verbose = FALSE,
+      rerank = FALSE
+    )
+# browser()
+    tm <- log_the_time(tm)
+    cat("...parallelising....")
+    cl <- parallel::makeCluster(
+      parallel::detectCores(),
+      type = 'PSOCK'
+    )
+    doParallel::registerDoParallel(cl)
+
+    # debugonce(rfe)
+    tm <- log_the_time(tm)
+    cat("...feature elimination stage....")
+    lrProfile <- caret::rfe(
+      recipe,
+      data = training(splits),
+      sizes = seq(
+        from = 50,
+        to = nrow(training(splits)),
+        by = 20
+      ),
+      rfeControl = ctrl,
+      metric = "Accuracy"
+    )
+
+    tm <- log_the_time(tm)
+    cat("...updating the recipe....")
+    recipe <- recipe |>
+      update_role(
+        all_of(setdiff(
+          predictors,
+          predictors(lrProfile)
+        )),
+        new_role = "recursive feature elimination"
+      )
+  }
+
+  if (auto_feature_selection == FALSE) tm <- Sys.time()
   if (model_type == "glmnet") {
+    cat("...logistic regression...")
     model_engine <- logistic_reg(
       penalty = tune(),
       mixture = tune()
@@ -199,21 +257,16 @@ model_function <- function(data, model_day, grid_search = 1, model_type) {
       set_engine(
         "glmnet",
         num.threads = !!cores
+      ) |>
+      set_mode(
+        "classification"
       )
 
     recipe <- recipe |>
-      step_normalize(all_predictors())
-
-    # grid <-
-    #   dials::parameters(
-    #     dials::num_comp(c(1, 9)),
-    #     dials::penalty(),
-    #     dials::mixture()
-    #   ) %>%
-    #   dials::grid_regular(levels = c(4, 10, 10)) %>%
-    #   arrange(num_terms, penalty, mixture)
+      step_normalize(all_numeric_predictors())
 
   } else if (model_type == "rf") {
+    cat("...random forest...")
     model_engine <- rand_forest(
       mtry = tune(),
       trees = tune(),
@@ -242,17 +295,40 @@ model_function <- function(data, model_day, grid_search = 1, model_type) {
       all_nominal_predictors()
     )
 
+  if (model_type == "glmnet") {
+    complete_params <- NULL
+  } else if (model_type == "rf") {
+    params <- tribble(
+        ~parameter, ~object,
+        "mtry", dials::mtry(),
+        "trees", dials::trees(),
+        "min_n", dials::min_n()
+      )
+
+    complete_params <- params |>
+      mutate(object = purrr::map(
+        object,
+        dials::finalize,
+        recipe |> prep() |> bake(new_data = NULL)
+      )
+    ) |>
+      pull(object) |>
+      dials::parameters()
+  }
+
   wflw <- workflow() |>
     add_model(model_engine) |>
     add_recipe(recipe)
-
-
-
+# browser()
+  tm <- log_the_time(tm)
+  cat("...tuning hyperparameters....")
   residuals <- tune::tune_grid(
     object = wflw,
     resamples = val_set,
     grid = grid_search,
+    param_info = complete_params,
     control = tune::control_grid(
+      parallel_over = "resamples",
       save_pred = TRUE,
       save_workflow = FALSE
     )
@@ -264,6 +340,8 @@ model_function <- function(data, model_day, grid_search = 1, model_type) {
   )
 
 
+  tm <- log_the_time(tm)
+  cat("...finalising workflow....")
   wflw_final <- wflw |>
     tune::finalize_workflow(best)
 
@@ -277,6 +355,8 @@ model_function <- function(data, model_day, grid_search = 1, model_type) {
     )
   )
 
+  tm <- log_the_time(tm)
+  cat("...understanding performance....")
   draw_roc_curves <- function(fit, metrics, grid_config) {
     plot <- fit |>
       collect_predictions() |>
@@ -329,6 +409,7 @@ model_function <- function(data, model_day, grid_search = 1, model_type) {
 
   test_roc <- draw_roc_curves(model_fit, test_metrics, unique(test_metrics$.config))
 
+  tm <- log_the_time(tm)
 
   return(list(
     val = list(
@@ -348,36 +429,120 @@ model_function <- function(data, model_day, grid_search = 1, model_type) {
 # modelling understanding -------------------------------------------------
 
 #' returns a calendar heatmap showing how predictions compare with observed
-visualise_model_predictions <- function(best_model_predictions, modelling_data, model_day) {
-  row_range <- range(best_model_predictions$.row)
+visualise_model_predictions <- function(best_model_test_predictions, best_model_val_predictions, modelling_data, model_day) {
+
+  threshold <- probably::threshold_perf(
+    best_model_val_predictions,
+    breach,
+    `.pred_0`,
+    thresholds = seq(0, 1, 0.01)
+  ) |>
+    filter(.metric == "j_index") |>
+    filter(.estimate == max(.estimate)) |>
+    pull(.threshold) |>
+    mean()
 
   heatmap <- modelling_data |>
     distinct(
       date, breach
     ) |>
     slice(-(1:7)) |>
-    filter(
-      between(
-        row_number(),
-        row_range[1],
-        row_range[2]
-      )
+    mutate(
+    .row = row_number()
     ) |>
     rename(
       breach_inputs = "breach"
     ) |>
-    bind_cols(
-      best_model_predictions
+    inner_join(
+      best_model_test_predictions,
+      by = join_by(.row)
     ) |>
     mutate(
       breach_predicted = case_when(
-        .pred_0 > 0.5 ~ 0,
+        .pred_0 > threshold ~ 0,
         .default = 1
       ),
       status = case_when(
-
+        breach_predicted == 1 & breach_inputs == 1 ~ "True positive",
+        breach_predicted == 1 & breach_inputs == 0 ~ "False positive",
+        breach_predicted == 0 & breach_inputs == 1 ~ "False negative",
+        .default = "True negative"
+      ),
+      status = factor(
+        status,
+        levels = c(
+          "True positive",
+          "True negative",
+          "False positive",
+          "False negative"
+        )),
+      wk = lubridate::week(date),
+      wkday = lubridate::wday(date, label = TRUE, week_start = 1),
+      month = lubridate::month(date, label = TRUE),
+      year = lubridate::year(date)
+    ) |>
+    ggplot(
+      aes(
+        x = wk,
+        y = wkday,
+        fill = status
       )
+    ) +
+    geom_tile(
+      colour = "black",
+      aes(
+        alpha = status
+      ),
+      show.legend = TRUE
+    ) +
+    labs(
+      x = "",
+      y = "",
+      title = paste("Day", model_day)
+    ) +
+    theme(
+      panel.background = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text.x = element_blank(),
+      strip.background = element_rect("grey92")
+    ) +
+    facet_grid(
+      rows = vars(year),
+      cols = vars(month),
+      scales = "free",
+      space = "free"
+    ) +
+    scale_fill_manual(
+      name = "",
+      values = c(
+        "True positive" = "#FFC107",
+        "True negative" = "#004D40",
+        "False positive" = "#1E88E5",
+        "False negative" = "#D81B60"
+      ),
+      drop = FALSE
+    ) +
+    scale_alpha_manual(
+      name = "",
+      values = c(
+        "True positive" = 0.15,
+        "True negative" = 0.15,
+        "False positive" = 1,
+        "False negative" = 1
+      ),
+      drop = FALSE
     )
 
   return(heatmap)
+}
+
+log_the_time <- function(previous_time) {
+  new_time <- Sys.time()
+  cat(
+    paste(
+      format(new_time - previous_time),
+      "\n"
+    )
+  )
+  return(new_time)
 }

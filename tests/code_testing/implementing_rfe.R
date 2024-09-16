@@ -4,33 +4,41 @@ source("R/00_libraries.R")
 library(modeldata)
 library(caret)
 
-df <- credit_data
+df <- m4_monthly |>
+  mutate(
+    value = case_when(
+      value > quantile(value, 0.9) ~ "high",
+      .default = "low"
+    ),
+    value = factor(value),
+    .by = id
+  )
 
-splits <- initial_validation_split(df)
+splits <- initial_validation_time_split(df)
 data_train <- training(splits)
 data_test <- testing(splits)
 val_set <- validation_set(splits)
 
-# recursive feature elimination
-ctrl <- rfeControl(
-  functions = lmFuncs,
-  method = "repeatedcv",
-  repeats = 5,
-  verbose = FALSE
-)
+# # recursive feature elimination
+# ctrl <- rfeControl(
+#   functions = lmFuncs,
+#   method = "repeatedcv",
+#   repeats = 5,
+#   verbose = FALSE
+# )
+#
+# lmProfile <- rfe(
+#   x = data_train |> select(where(is.numeric)),
+#   y = data_train |> pull("Status"),
+#   sizes = 1:5,
+#   rfeControl = ctrl,
+#   na.action = na.omit,
+#   metric = "Accuracy"
+# )
+#
+# predictors(lmProfile)
 
-lmProfile <- rfe(
-  x = data_train |> select(where(is.numeric)),
-  y = data_train |> pull("Status"),
-  sizes = 1:5,
-  rfeControl = ctrl,
-  na.action = na.omit,
-  metric = "Accuracy"
-)
-
-predictors(lmProfile)
-
-predictors <- setdiff(names(data_train), "Status")
+predictors <- setdiff(names(data_train), c("date", "value"))
 
 cores <- parallel::detectCores()
 
@@ -45,23 +53,71 @@ model_engine <- logistic_reg(
 
 rec <- recipe(x = data_train) |>
   update_role(
-    Status,
+    value,
     new_role = "outcome"
   ) |>
   update_role(
     all_of(predictors),
     new_role = "predictor"
   ) |>
-  step_unknown(
-    all_nominal_predictors()
+  step_date(
+    date
   ) |>
-  step_impute_median(
-    all_numeric_predictors()
+  step_rm(
+    date
   ) |>
-  step_naomit(
-    Status
+  # step_unknown(
+  #   all_nominal_predictors()
+  # ) |>
+  # step_impute_median(
+  #   all_numeric_predictors()
+  # ) |>
+  # step_naomit(
+  #   Status
+  # ) |>
+  step_dummy(
+    recipes::all_nominal_predictors()
   ) |>
-  step_dummy(all_nominal_predictors())
+  step_nzv(recipes::all_predictors()) |>
+  step_corr()
+
+# recursive feature elimination
+
+baked_cols <- rec |>
+  prep(
+    training = data_train
+  ) |>
+  juice(
+    all_predictors()
+  ) |> #summary()
+  ncol()
+
+ctrl <- rfeControl(
+  functions = lrFuncs,
+  method = "timeslice",
+  repeats = 5,
+  verbose = FALSE,
+  rerank = TRUE
+)
+# debugonce(rfe)
+lrProfile <- rfe(
+  rec,
+  data = data_train,
+  sizes = 2:baked_cols,
+  rfeControl = ctrl,
+  # na.action = na.omit,
+  metric = "Accuracy"
+)
+
+rec <- rec |>
+  update_role(
+    all_of(setdiff(
+      predictors,
+      predictors(lmProfile)
+    )),
+    new_role = "recursive feature elimination"
+  )
+
 
 wflw <- workflow() |>
   add_model(model_engine) |>

@@ -145,18 +145,18 @@ rm(all_metrics, frontier_three_hour_data, breaches)
 
 start_time <- Sys.time()
 
-best_models <- 1 |>
+best_models <- 1:10 |>
   purrr::map(
     ~ model_function(
       modelling_data,
       model_day = .x,
       grid_search = 30,
-      model_type = "rf"
+      model_type = "rf",
+      auto_feature_selection = FALSE
     )
   )
 
 Sys.time() - start_time
-
 
 val_rocs <- purrr::map(
   best_models,
@@ -191,9 +191,61 @@ ggsave(
   units = "in",
   bg = NA
 )
+debugonce(visualise_model_predictions)
 
 
-visualise_model_predictions(
-  best_models[[1]]$test$predictions,
-  modelling_data
-) |> View()
+select_best_model <- function(best_model_by_day) {
+  if ("mixture" %in% names(best_model_by_day)) {
+    bm <- best_model_by_day |>
+      filter(
+        .metric == "roc_auc",
+        mean == max(mean),
+        .by = .metric
+      ) |>
+      filter(
+        mixture == max(mixture)
+      )
+  } else if ("trees" %in% names(best_model_by_day)) {
+    bm <- best_model_by_day |>
+      filter(
+        .metric == "roc_auc",
+        mean == max(mean),
+        .by = .metric
+      ) |>
+      filter(
+        mtry == min(mtry)
+      )
+  }
+}
+
+
+test_set_predictions <- purrr::map(
+  1:10,
+  ~ visualise_model_predictions(
+    best_model_test_predictions = best_models[[.x]]$test$predictions,
+    best_model_val_predictions = best_models[[.x]]$val$predictions |>
+      inner_join(
+        select_best_model(
+          best_models[[.x]]$val$metrics
+        )#,
+        # by = join_by(
+        #   .config, penalty, mixture
+        # )
+      ),
+    modelling_data,
+    model_day = .x
+  )
+) |>
+  patchwork::wrap_plots(
+    ncol = 5,
+    guides = "collect"
+  )
+
+ggsave(
+  test_set_predictions,
+  filename = "outputs/test_prediction_status_rf.png",
+  width = 18,
+  height = 5,
+  units = "in",
+  bg = NA
+)
