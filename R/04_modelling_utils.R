@@ -144,7 +144,7 @@ lag_function <- function(data, lags) {
     mutate(
       across(
         !c(date, breach),
-         ~multilag(.x, lags),
+         ~ multilag(.x, lags),
         .unpack = TRUE
       ),
       .keep = "unused"
@@ -170,21 +170,30 @@ model_function <- function(data, model_day, grid_search = 1, model_type, auto_fe
   # splits <- initial_validation_split(data)
   val_set <- validation_set(splits)
 
-  predictors <- setdiff(names(data), c("date", "breach"))
+  # predictors <- setdiff(names(data), c("date", "breach"))
 
 
   recipe <- recipe(
-    x = training(splits)
+    breach ~ .,
+    data = training(splits)
   ) |>
     step_date(
       date,
-      features = c("dow", "month")
+      features = c("dow", "month"),
+      role = "date_features"
     ) |>
     step_rm(date) |>
-    update_role(breach, new_role = "outcome") |>
-    update_role(all_of(predictors), new_role = "predictor") |>
-    step_nzv(all_numeric_predictors()) |>
-    step_corr(all_numeric_predictors())
+    # update_role(breach, new_role = "outcome") |>
+    # update_role(all_of(predictors), new_role = "predictor") |>
+    step_nzv(recipes::all_numeric_predictors()) |>
+    step_corr(recipes::all_numeric_predictors())
+
+  if (model_type == "glmnet") {
+    recipe <- recipe |>
+      step_normalize(
+        recipes::all_numeric_predictors()
+      )
+  }
 
   cores <- parallel::detectCores()
 
@@ -194,45 +203,60 @@ model_function <- function(data, model_day, grid_search = 1, model_type, auto_fe
     tm <- log_the_time(tm)
     cat("...counting baked cols....")
     baked_cols <- recipe |>
-      prep(
-        training = training(splits)
-      ) |>
-      juice(
-        all_predictors()
-      ) |>
-      ncol()
+      prep()
+
+    predictors <- baked_cols |>
+      summary() |>
+      filter(role == "predictor") |>
+      pull(variable)
+
+    baked_cols <- length(predictors)
 
     tm <- log_the_time(tm)
-    cat("...rfeControl stage....")
-    ctrl <- caret::rfeControl(
-      functions = lrFuncs,
-      method = "timeslice",
+    # cat("...rfeControl stage....")
+    # ctrl <- caret::rfeControl(
+    #   functions = caret::lrFuncs,
+    #   method = "repeatedcv",
+    #   repeats = 5,
+    #   verbose = FALSE,
+    #   rerank = TRUE
+    # )
+    cat("...sbfControl stage....")
+    ctrl <- caret::sbfControl(
+      functions = caret::lrFuncs,
+      method = "repeatedcv",
       repeats = 5,
-      verbose = FALSE,
-      rerank = FALSE
+      verbose = FALSE
     )
 # browser()
     tm <- log_the_time(tm)
-    cat("...parallelising....")
-    cl <- parallel::makeCluster(
-      parallel::detectCores(),
-      type = 'PSOCK'
-    )
-    doParallel::registerDoParallel(cl)
+    # cat("...parallelising....")
+    # cl <- parallel::makeCluster(
+    #   2,
+    #   type = 'PSOCK'
+    # )
+    # doParallel::registerDoParallel(cl)
 
     # debugonce(rfe)
     tm <- log_the_time(tm)
     cat("...feature elimination stage....")
-    lrProfile <- caret::rfe(
+    browser()
+    # lrProfile <- caret::rfe(
+    #   recipe,
+    #   data = training(splits),
+    #   sizes = seq(
+    #     from = 50,
+    #     to = baked_cols,
+    #     by = 100
+    #   ),
+    #   rfeControl = ctrl,
+    #   metric = "Accuracy"
+    # )
+
+    lr_with_filter <- caret::sbf(
       recipe,
       data = training(splits),
-      sizes = seq(
-        from = 50,
-        to = nrow(training(splits)),
-        by = 20
-      ),
-      rfeControl = ctrl,
-      metric = "Accuracy"
+      sbfControl = ctrl
     )
 
     tm <- log_the_time(tm)
@@ -245,9 +269,8 @@ model_function <- function(data, model_day, grid_search = 1, model_type, auto_fe
         )),
         new_role = "recursive feature elimination"
       )
-  }
+  } else if (auto_feature_selection == FALSE) tm <- Sys.time()
 
-  if (auto_feature_selection == FALSE) tm <- Sys.time()
   if (model_type == "glmnet") {
     cat("...logistic regression...")
     model_engine <- logistic_reg(
@@ -256,14 +279,14 @@ model_function <- function(data, model_day, grid_search = 1, model_type, auto_fe
     ) |>
       set_engine(
         "glmnet",
+        family = stats::binomial(link = "logit"),
         num.threads = !!cores
       ) |>
       set_mode(
         "classification"
       )
 
-    recipe <- recipe |>
-      step_normalize(all_numeric_predictors())
+
 
   } else if (model_type == "rf") {
     cat("...random forest...")
@@ -292,7 +315,8 @@ model_function <- function(data, model_day, grid_search = 1, model_type, auto_fe
 
   recipe <- recipe |>
     step_dummy(
-      all_nominal_predictors()
+      # recipes::all_nominal_predictors()
+      recipes::has_role("date_features")
     )
 
   if (model_type == "glmnet") {

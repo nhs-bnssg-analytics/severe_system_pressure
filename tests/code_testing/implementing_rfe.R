@@ -84,23 +84,19 @@ rec <- recipe(x = data_train) |>
 # recursive feature elimination
 
 baked_cols <- rec |>
-  prep(
-    training = data_train
-  ) |>
-  juice(
-    all_predictors()
-  ) |> #summary()
+  prep() |>
+  bake(new_data = NULL) |> #summary()
   ncol()
-
-ctrl <- rfeControl(
-  functions = lrFuncs,
-  method = "timeslice",
+start <- Sys.time()
+ctrl <- caret::rfeControl(
+  functions = caret::lrFuncs,
+  method = "cv",
   repeats = 5,
   verbose = FALSE,
   rerank = TRUE
 )
 # debugonce(rfe)
-lrProfile <- rfe(
+lrProfile <- caret::rfe(
   rec,
   data = data_train,
   sizes = 2:baked_cols,
@@ -108,12 +104,20 @@ lrProfile <- rfe(
   # na.action = na.omit,
   metric = "Accuracy"
 )
+Sys.time() - start
+plot(lrProfile, type=c("g", "o"))
+
+post_prep_predictors <- rec |>
+  prep() |>
+  summary() |>
+  filter(role == "predictor") |>
+  pull(variable)
 
 rec <- rec |>
   update_role(
     all_of(setdiff(
-      predictors,
-      predictors(lmProfile)
+      post_prep_predictors,
+      caret::predictors(lrProfile)
     )),
     new_role = "recursive feature elimination"
   )

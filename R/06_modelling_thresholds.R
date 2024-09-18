@@ -44,14 +44,21 @@ frontier_three_hour_data <- all_metrics |>
   ) |>
   ungroup() |>
   mutate(
-    metric_name = paste0(
-      metric_name,
-      " (",
-      org_name,
-      ")"
+    metric_name = paste(
+      gsub("\\(|\\)", "", metric_name),
+      org_name
+    ),
+    metric_name = gsub(" |&", ".", metric_name),
+    metric_name = gsub("[[:punct:]]", ".", metric_name),
+    metric_name = case_when(
+      grepl("^[[:digit:]]", metric_name) ~ paste0("X", metric_name),
+      .default = metric_name
     ),
     .keep = "unused"
   ) |>
+  # filter(
+  #   metric_name %in% head(unique(metric_name), 20)
+  # ) |>
   pivot_wider(
     names_from = metric_name,
     values_from = value
@@ -92,7 +99,7 @@ modelling_data <- right_join(
   filter(!is.na(breach)) |>
   mutate(
     date = as.Date(time - 1),
-    breach = factor(ifelse(breach==TRUE, 1, 0)),
+    breach = factor(ifelse(breach == TRUE, 1, 0)),
     .keep = "unused"
   ) |>
   tidyr::pivot_longer(
@@ -134,25 +141,35 @@ modelling_data <- right_join(
     values_to = "value"
   ) |>
   mutate(
-    metric = paste(metric, stat),
+    metric = paste(metric, stat, sep = "."),
     .keep = "unused"
   )
 
+metrics_junk <- modelling_data |>
+  pull(metric) |>
+  unique()
 
+table(str_count(metrics_junk, " "))
+table(str_count(metrics_junk, "^[[:digit:]]"))
+table(str_count(metrics_junk, "&"))
+table(str_count(metrics_junk, "[[:punct:]]"))
 
+str_extract_all(metrics_junk, "[[:punct:]]") |>
+  unlist() |>
+  unique()
 
 rm(all_metrics, frontier_three_hour_data, breaches)
 
 start_time <- Sys.time()
-
-best_models <- 1:10 |>
+# debugonce(model_function)
+best_models <- 1 |>
   purrr::map(
     ~ model_function(
       modelling_data,
       model_day = .x,
       grid_search = 30,
-      model_type = "rf",
-      auto_feature_selection = FALSE
+      model_type = "glmnet",
+      auto_feature_selection = TRUE
     )
   )
 
